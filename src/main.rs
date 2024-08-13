@@ -18,7 +18,7 @@ use std::io::Read;
 
 use termion::{async_stdin, terminal_size};
 
-use bollard::container::{AttachContainerOptions, CreateContainerOptions};
+use bollard::container::{AttachContainerOptions, CreateContainerOptions, AttachContainerResults};
 use tokio::io::AsyncWriteExt;
 
 const IMAGE: &str = "timescale/live-migration:latest";
@@ -101,6 +101,19 @@ impl LiveMigration {
         Ok(self.docker.start_container::<String>(&id, None).await?)
     }
 
+    async fn attach_container(&self, name: &str) -> Result<AttachContainerResults, Box<dyn std::error::Error>> {
+            let options = Some(AttachContainerOptions::<&str> {
+                stdin: Some(true),
+                stdout: Some(true),
+                stderr: Some(true),
+                stream: Some(true),
+                logs: Some(true),
+                detach_keys: Some("ctrl-c"),
+            });
+
+            Ok(self.docker.attach_container(name, options).await?)
+    }
+
     async fn snapshot(&self) -> Result<(), Box<dyn std::error::Error>> {
         let response = self.docker.inspect_container(SNAPSHOT, None).await;
         let create_snapshot = match response {
@@ -123,16 +136,8 @@ impl LiveMigration {
 
             self.create_container(SNAPSHOT, args).await?;
 
-            let options = Some(AttachContainerOptions::<&str> {
-                stdin: Some(true),
-                stdout: Some(true),
-                stderr: Some(true),
-                stream: Some(true),
-                logs: Some(true),
-                detach_keys: Some("ctrl-c"),
-            });
+            let mut result = self.attach_container(SNAPSHOT).await?;
 
-            let mut result = self.docker.attach_container(SNAPSHOT, options).await?;
             while let Some(Ok(msg)) = result.output.next().await {
                 print!("{msg}");
                 if fs::read(format!("{}/snapshot", self.dir)).await.is_ok() {
@@ -168,16 +173,7 @@ impl LiveMigration {
             self.create_container(MIGRATE, args).await?;
         }
 
-        let options = Some(AttachContainerOptions::<&str> {
-            stdin: Some(true),
-            stdout: Some(true),
-            stderr: Some(true),
-            stream: Some(true),
-            logs: Some(true),
-            detach_keys: Some("ctrl-c"),
-        });
-
-        let mut result = self.docker.attach_container(MIGRATE, options).await?;
+        let mut result = self.attach_container(MIGRATE).await?;
         // pipe stdin into the docker exec stream input
         spawn(async move {
             let mut stdin = async_stdin().bytes();
@@ -204,9 +200,9 @@ impl LiveMigration {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: Use command line arguments instead of environment variables
-    let source = env::var("PGCOPYDB_SOURCE_PGURI")?;
-    let target = env::var("PGCOPYDB_TARGET_PGURI")?;
-    let dir = env::var("PGCOPYDB_DIR")?;
+    let source = env::var("PGCOPYDB_SOURCE_PGURI").expect("env PGCOPYDB_SOURCE_PGURI not set");
+    let target = env::var("PGCOPYDB_TARGET_PGURI").expect("env PGCOPYDB_TARGET_PGURI not set");
+    let dir = env::var("PGCOPYDB_DIR").expect("env PGCOPYDB_DIR not set");
 
     let _ = fs::create_dir(&dir).await;
 
