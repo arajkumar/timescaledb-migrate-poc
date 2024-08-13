@@ -22,77 +22,151 @@ use bollard::container::{AttachContainerOptions, CreateContainerOptions};
 use tokio::io::AsyncWriteExt;
 
 const IMAGE: &str = "timescale/live-migration:latest";
+const SNAPSHOT: &str = "live-migration-snapshot";
+const MIGRATE: &str = "live-migration-migrate";
+const CLEAN: &str = "live-migration-migrate";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = env::var("PGCOPYDB_SOURCE_PGURI")?;
-    let target = env::var("PGCOPYDB_TARGET_PGURI")?;
-    let dir = env::var("PGCOPYDB_DIR")?;
+struct LiveMigration {
+    docker: Docker,
+    source: String,
+    target: String,
+    dir: String,
+}
 
-    fs::create_dir(&dir).await?;
+impl LiveMigration {
+    async fn new(
+        docker: Docker,
+        source: String,
+        target: String,
+        dir: String,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        docker
+            .create_image(
+                Some(CreateImageOptions {
+                    from_image: IMAGE,
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(Self {
+            docker,
+            source,
+            target,
+            dir,
+        })
+    }
 
-    let docker = Docker::connect_with_socket_defaults().unwrap();
-
-    docker
-        .create_image(
-            Some(CreateImageOptions {
-                from_image: IMAGE,
-                ..Default::default()
-            }),
-            None,
-            None,
-        )
-        .try_collect::<Vec<_>>()
-        .await?;
-
-    let snapshot = "live-migration-snapshot";
-
-    let response = docker.inspect_container(snapshot, None).await;
-
-    let create_snapshot = match response {
-        Ok(r) => {
-            // If the container is not running, remove it
-            if r.state.as_ref().unwrap().running.unwrap() {
-                false
-            } else {
-                docker.remove_container(snapshot, None).await?;
-                true
-            }
-        }
-        Err(_) => true,
-    };
-
-    if create_snapshot {
-        println!("Creating snapshot container");
-
-        let args = vec!["snapshot".to_string()];
-        let env = vec![
-            format!("PGCOPYDB_TARGET_PGURI={}", target.clone(),),
-            format!("PGCOPYDB_SOURCE_PGURI={}", source.clone(),),
-        ];
-
-        let alpine_config = Config {
+    async fn create_container(
+        &self,
+        name: &str,
+        args: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // TODO: Add the following
+        // - user (--user=$(id -u):$(id -g))
+        // - pid (--pid=host)
+        // - restart policy (--restart=always)
+        let config = Config {
             image: Some(IMAGE.to_string()),
             cmd: Some(args),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            attach_stdin: Some(true),
             tty: Some(true),
-            env: Some(env),
+            open_stdin: Some(true),
+            env: Some(vec![
+                format!("PGCOPYDB_TARGET_PGURI={}", self.target.clone(),),
+                format!("PGCOPYDB_SOURCE_PGURI={}", self.source.clone(),),
+            ]),
             host_config: Some(HostConfig {
-                binds: Some(vec![format!("{dir}:/opt/timescale/ts_cdc")]),
+                binds: Some(vec![format!("{}:/opt/timescale/ts_cdc", self.dir)]),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
         let options = CreateContainerOptions {
-            name: snapshot,
+            name,
             ..Default::default()
         };
 
-        let id = docker
-            .create_container::<&str, String>(Some(options), alpine_config)
+        let id = self
+            .docker
+            .create_container::<&str, String>(Some(options), config)
             .await?
             .id;
-        docker.start_container::<String>(&id, None).await?;
+
+        Ok(self.docker.start_container::<String>(&id, None).await?)
+    }
+
+    async fn snapshot(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let response = self.docker.inspect_container(SNAPSHOT, None).await;
+        let create_snapshot = match response {
+            Ok(r) => {
+                // If the container is not running, remove it
+                if r.state.as_ref().unwrap().running.unwrap() {
+                    false
+                } else {
+                    self.docker.remove_container(SNAPSHOT, None).await?;
+                    true
+                }
+            }
+            Err(_) => true,
+        };
+
+        if create_snapshot {
+            println!("Creating snapshot container");
+
+            let args = vec!["snapshot".to_string()];
+
+            self.create_container(SNAPSHOT, args).await?;
+
+            let options = Some(AttachContainerOptions::<&str> {
+                stdin: Some(true),
+                stdout: Some(true),
+                stderr: Some(true),
+                stream: Some(true),
+                logs: Some(true),
+                detach_keys: Some("ctrl-c"),
+            });
+
+            let mut result = self.docker.attach_container(SNAPSHOT, options).await?;
+            while let Some(Ok(msg)) = result.output.next().await {
+                print!("{msg}");
+                if fs::read(format!("{}/snapshot", self.dir)).await.is_ok() {
+                    println!("Snapshot file created");
+                    break;
+                }
+            }
+        } else {
+            println!("Snapshot container already exists");
+        }
+        Ok(())
+    }
+
+    async fn migrate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut args = vec!["migrate".to_string()];
+
+        let migrate_running = match self.docker.inspect_container(MIGRATE, None).await {
+            Ok(r) => {
+                // If the container is not running, remove it
+                if r.state.as_ref().unwrap().running.unwrap() {
+                    true
+                } else {
+                    self.docker.remove_container(MIGRATE, None).await?;
+                    args.push("--resume".to_string());
+                    false
+                }
+            }
+            Err(_) => false,
+        };
+
+        if !migrate_running {
+            println!("Creating migrate container");
+            self.create_container(MIGRATE, args).await?;
+        }
 
         let options = Some(AttachContainerOptions::<&str> {
             stdin: Some(true),
@@ -103,96 +177,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             detach_keys: Some("ctrl-c"),
         });
 
-        let mut result = docker.attach_container(&id, options).await?;
+        let mut result = self.docker.attach_container(MIGRATE, options).await?;
+        // pipe stdin into the docker exec stream input
+        spawn(async move {
+            let mut stdin = async_stdin().bytes();
+            loop {
+                if let Some(Ok(byte)) = stdin.next() {
+                    result.input.write_all(&[byte]).await.ok();
+                } else {
+                    sleep(Duration::from_nanos(10)).await;
+                }
+            }
+        });
+
         while let Some(Ok(msg)) = result.output.next().await {
             print!("{msg}");
-            if let Ok(_) = fs::read(format!("{dir}/snapshot")).await {
-                println!("Snapshot file created");
-                break;
-            }
         }
-    } else {
-        println!("Snapshot container already exists");
+        Ok(())
     }
 
-    // Check dir has a snapshot file created with content.
-    // Now run migrate
-    let migrate = "live-migration-migrate";
-
-    let mut args = vec!["migrate".to_string()];
-
-    let migrate_running = match docker.inspect_container(migrate, None).await {
-        Ok(r) => {
-            // If the container is not running, remove it
-            if r.state.as_ref().unwrap().running.unwrap() {
-                true
-            } else {
-                docker.remove_container(migrate, None).await?;
-                args.push("--resume".to_string());
-                false
-            }
-        }
-        Err(_) => false,
-    };
-
-    if !migrate_running {
-        println!("Creating migrate container");
-
-        let alpine_config = Config {
-            image: Some(IMAGE.to_string()),
-            cmd: Some(args),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            attach_stdin: Some(true),
-            tty: Some(true),
-            open_stdin: Some(true),
-            env: Some(vec![
-                format!("PGCOPYDB_TARGET_PGURI={}", target.clone(),),
-                format!("PGCOPYDB_SOURCE_PGURI={}", source.clone(),),
-            ]),
-            host_config: Some(HostConfig {
-                binds: Some(vec![format!("{dir}:/opt/timescale/ts_cdc")]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let options = CreateContainerOptions {
-            name: migrate,
-            ..Default::default()
-        };
-
-        let id = docker
-            .create_container::<&str, String>(Some(options), alpine_config)
-            .await?
-            .id;
-        docker.start_container::<String>(&id, None).await?;
+    async fn clean(&self) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
     }
+}
 
-    let options = Some(AttachContainerOptions::<&str> {
-        stdin: Some(true),
-        stdout: Some(true),
-        stderr: Some(true),
-        stream: Some(true),
-        logs: Some(true),
-        detach_keys: Some("ctrl-c"),
-    });
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // TODO: Use command line arguments instead of environment variables
+    let source = env::var("PGCOPYDB_SOURCE_PGURI")?;
+    let target = env::var("PGCOPYDB_TARGET_PGURI")?;
+    let dir = env::var("PGCOPYDB_DIR")?;
 
-    let mut result = docker.attach_container(migrate, options).await?;
-    // pipe stdin into the docker exec stream input
-    spawn(async move {
-        let mut stdin = async_stdin().bytes();
-        loop {
-            if let Some(Ok(byte)) = stdin.next() {
-                result.input.write_all(&[byte]).await.ok();
-            } else {
-                sleep(Duration::from_nanos(10)).await;
-            }
-        }
-    });
+    let _ = fs::create_dir(&dir).await;
 
-    while let Some(Ok(msg)) = result.output.next().await {
-        print!("{msg}");
-    }
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    let live_migration =
+        LiveMigration::new(docker, source.clone(), target.clone(), dir.clone()).await?;
+
+    live_migration.snapshot().await?;
+    live_migration.migrate().await?;
+
     Ok(())
 }
