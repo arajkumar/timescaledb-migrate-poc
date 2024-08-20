@@ -1,5 +1,7 @@
 use tokio::fs;
 
+use argmap;
+
 use bollard::container::Config;
 use bollard::Docker;
 
@@ -199,6 +201,8 @@ impl LiveMigration {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (args, argv) = argmap::parse(std::env::args());
+
     // TODO: Use command line arguments instead of environment variables
     let source = env::var("PGCOPYDB_SOURCE_PGURI").expect("env PGCOPYDB_SOURCE_PGURI not set");
     let target = env::var("PGCOPYDB_TARGET_PGURI").expect("env PGCOPYDB_TARGET_PGURI not set");
@@ -210,8 +214,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let live_migration =
         LiveMigration::new(docker, source.clone(), target.clone(), dir.clone()).await?;
 
-    live_migration.snapshot().await?;
-    live_migration.migrate().await?;
+    if argv.contains_key("clean") {
+        live_migration.clean().await?;
+    } else {
+        live_migration.snapshot().await?;
+        live_migration.migrate().await?;
+    }
 
     Ok(())
 }
