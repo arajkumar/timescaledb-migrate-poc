@@ -17,6 +17,11 @@ use tokio::time::sleep;
 use tokio::time::Duration;
 
 use std::io::Read;
+use std::io::{stdin, BufRead, BufReader};
+
+
+
+use tokio::sync::mpsc;
 
 use termion::{async_stdin, terminal_size};
 
@@ -33,6 +38,25 @@ struct LiveMigration {
     source: String,
     target: String,
     dir: String,
+}
+
+pub fn recv_from_stdin(buffer_size: usize) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>(buffer_size);
+    let stdin = BufReader::new(stdin());
+    std::thread::spawn(move || read_loop(stdin, tx));
+    rx
+}
+
+fn read_loop<R>(reader: R, tx: mpsc::Sender<String>)
+where
+    R: BufRead,
+{
+    let mut lines = reader.lines();
+    loop {
+        if let Some(Ok(line)) = lines.next() {
+            let _ = tx.blocking_send(line);
+        }
+    }
 }
 
 impl LiveMigration {
@@ -177,20 +201,38 @@ impl LiveMigration {
 
         let mut result = self.attach_container(MIGRATE).await?;
         // pipe stdin into the docker exec stream input
-        spawn(async move {
-            let mut stdin = async_stdin().bytes();
-            loop {
-                if let Some(Ok(byte)) = stdin.next() {
-                    result.input.write_all(&[byte]).await.ok();
-                } else {
-                    sleep(Duration::from_nanos(10)).await;
+        // spawn(async move {
+        //     let mut stdin = async_stdin().bytes();
+        //     loop {
+        //         if let Some(Ok(byte)) = stdin.next() {
+        //             result.input.write_all(&[byte]).await.ok();
+        //         } else {
+        //             sleep(Duration::from_nanos(10)).await;
+        //         }
+        //     }
+        // });
+        let mut stdin = recv_from_stdin(1024);
+        let mut out = result.output;
+
+        loop {
+            tokio::select! {
+                Some(s) = stdin.recv() => {
+                    let s = format!("{s}\n");
+                    result.input.write_all(s.as_bytes()).await.ok();
+                }
+                msg = out.next() => {
+                    if let Some(Ok(msg)) = msg {
+                        print!("{msg}");
+                    } else {
+                        break;
+                    }
+                }
+                else => {
+                    break;
                 }
             }
-        });
-
-        while let Some(Ok(msg)) = result.output.next().await {
-            print!("{msg}");
         }
+
         Ok(())
     }
 
